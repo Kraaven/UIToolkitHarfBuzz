@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text; 
+using System.Text;
 using HarfBuzzSharp;
 using SkiaSharp;
 using UnityEngine;
@@ -10,42 +10,42 @@ using UnityEngine;
 public class HarfBuzzDirectRenderer : MonoBehaviour
 {
     // --- Configuration Flags ---
-    private const bool PRINT_LOGS = true;           // Set to true to accumulate and print all logs at the end.
-    private const bool GENERATE_DEBUG_PNG = true; 
-    
+    private const bool PRINT_LOGS = true;
+    private const bool GENERATE_DEBUG_PNG = true;
+
     // --- Font & Atlas Constants ---
-    private const string TEXT_TO_RENDER = "வணக்கம்";
-    private const string FONT_FILENAME = "Tamil.ttf";
-    private const string CACHE_TEX_FILENAME = "font_atlas_all.bytes"; 
-    private const string CACHE_META_FILENAME = "font_meta_all.bin";    
-    private const string DEBUG_PNG_FILENAME = "font_atlas_ALL_GLYPHS.png"; 
+    public string TEXT_TO_RENDER = "";
+    public string FONT_FILENAME = "Tamil.ttf";
+    private const string CACHE_TEX_FILENAME = "font_atlas_all.bytes";
+    private const string CACHE_META_FILENAME = "font_meta_all.bin";
+    private const string DEBUG_PNG_FILENAME = "font_atlas_ALL_GLYPHS.png";
 
     private string cachePath;
-    
+
     // --- Font & System Fields ---
     private byte[] fontData;
     private Face fontFace;
     private SKTypeface skTypeface;
     private SKFont skFont;
-    
+
     // --- Atlas Fields ---
-    private int atlasSize = 4096;
+    private int atlasSize = 2048;
     private int currentX = 0;
     private int currentY = 0;
     private int rowHeight = 0;
     private int padding = 4;
-    private const int RASTER_SAFETY_MARGIN = 2; // Extra pixels added to dimensions to prevent clipping
-    private const float UnitsPerPixel = 64f; 
+    private const int RASTER_SAFETY_MARGIN = 2;
+    private const float UnitsPerPixel = 64f; // matches your original scaling convention
 
     private Texture2D atlasTexture;
     private Dictionary<uint, GlyphAtlasInfo> glyphAtlas = new Dictionary<uint, GlyphAtlasInfo>();
-    
+
     // --- Internal Data Structures ---
     private class GlyphAtlasInfo
     {
         public Rect uvRect;
-        public Vector2 size; 
-        public Vector2 bearing; // Stores HarfBuzz XBearing/YBearing for spacing
+        public Vector2 size;
+        public Vector2 bearing; // stored in font units => converted to world units when used
         public uint glyphId;
     }
 
@@ -61,118 +61,90 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
     void Start()
     {
         StringBuilder log = new StringBuilder();
-        if (PRINT_LOGS) log.AppendLine("--- HarfBuzzDirectRenderer START (Log Buffer Initialized) ---");
+        if (PRINT_LOGS) log.AppendLine("--- HarfBuzzDirectRenderer START ---");
 
         cachePath = Application.persistentDataPath;
 
-        if (PRINT_LOGS) log.AppendLine($"HB asset files goes to : {cachePath}");
-        
-        // --- 1. Load font ---
         string fontPath = Path.Combine(Application.streamingAssetsPath, FONT_FILENAME);
         if (!File.Exists(fontPath))
         {
-            Debug.LogError($"CRITICAL: Font file not found at: {fontPath}.");
+            Debug.LogError($"CRITICAL: Font file not found at: {fontPath}");
             return;
         }
-        try
-        {
-            fontData = File.ReadAllBytes(fontPath);
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"CRITICAL: Failed to load font data: {e.Message}");
-            return;
-        }
-        
-        // --- 2. Setup HarfBuzz/SkiaSharp ---
+
+        try { fontData = File.ReadAllBytes(fontPath); }
+        catch (Exception e) { Debug.LogError($"CRITICAL: Failed to load font data: {e.Message}"); return; }
+
+        // Create HarfBuzz Face from blob (free memory after blob)
         IntPtr ptr = Marshal.AllocHGlobal(fontData.Length);
         Marshal.Copy(fontData, 0, ptr, fontData.Length);
-        
-        using (var blob = new Blob(ptr, fontData.Length, MemoryMode.ReadOnly, 
-            () => Marshal.FreeHGlobal(ptr)))
+        using (var blob = new Blob(ptr, fontData.Length, MemoryMode.ReadOnly, () => Marshal.FreeHGlobal(ptr)))
         {
             fontFace = new Face(blob, 0);
         }
-        
+
         skTypeface = SKTypeface.FromData(SKData.CreateCopy(fontData));
-        
         if (fontFace == null || skTypeface == null)
         {
             Debug.LogError("CRITICAL: HarfBuzz or SkiaSharp setup failed.");
             return;
         }
+
         if (PRINT_LOGS) log.AppendLine("Font loaded and HarfBuzz/SkiaSharp setup complete.");
 
-        // --- 3. Initial Setup and Caching Logic ---
         float renderTextSize = 64f;
-        skFont = new SKFont(skTypeface, renderTextSize); 
-        
+        skFont = new SKFont(skTypeface, renderTextSize);
         var hbFont = new HarfBuzzSharp.Font(fontFace);
-        hbFont.SetScale((int)(renderTextSize * UnitsPerPixel), (int)(renderTextSize * UnitsPerPixel)); 
-        
-        HarfBuzzSharp.Buffer buffer = null;
-        GlyphInfo[] infos = null;
-        GlyphPosition[] positions = null;
-        
-        if (TryLoadAtlasBinary(log)) 
-        {
-            if (PRINT_LOGS) log.AppendLine("Atlas loaded from efficient binary cache successfully.");
-        }
-        else
+        hbFont.SetScale((int)(renderTextSize * UnitsPerPixel), (int)(renderTextSize * UnitsPerPixel));
+
+        // Build or load atlas
+        if (!TryLoadAtlasBinary(log))
         {
             if (PRINT_LOGS) log.AppendLine("Cache not found or failed to load. Generating full static atlas for ALL glyphs...");
 
-            // 4. Get ALL available glyph IDs from the font
-            HashSet<uint> allGlyphIds = GetAllGlyphIds(skTypeface, log); 
-
-            // 5. Create and rasterize the atlas
+            HashSet<uint> allGlyphIds = GetAllGlyphIds(skTypeface, log);
             atlasTexture = new Texture2D(atlasSize, atlasSize, TextureFormat.Alpha8, false);
             Color32[] clearColors = new Color32[atlasSize * atlasSize];
-            for (int i = 0; i < clearColors.Length; i++)
-                clearColors[i] = new Color32(0, 0, 0, 0);
+            for (int i = 0; i < clearColors.Length; i++) clearColors[i] = new Color32(0, 0, 0, 0);
             atlasTexture.SetPixels32(clearColors);
-            
-            RasterizeRequiredGlyphsToAtlas(hbFont, allGlyphIds, log); 
-            
+
+            RasterizeRequiredGlyphsToAtlas(hbFont, allGlyphIds, log);
+
             atlasTexture.Apply();
-            
-            // 6. Save the newly generated atlas
-            SaveAtlasBinary(log); 
+            SaveAtlasBinary(log);
         }
-        
-        // 7. Common Rendering Path (Shaping the actual text)
-        buffer = new HarfBuzzSharp.Buffer(); 
+        else
+        {
+            if (PRINT_LOGS) log.AppendLine("Atlas loaded from binary cache successfully.");
+        }
+
+        // Shape text
+        var buffer = new HarfBuzzSharp.Buffer();
         buffer.AddUtf16(TEXT_TO_RENDER);
-        buffer.Direction = Direction.LeftToRight;
-        buffer.Script = Script.Tamil;
-        buffer.Language = new Language("ta");
-        
+        buffer.Direction = Direction.RightToLeft;
+        buffer.Script = Script.Arabic;
+        buffer.Language = new Language("ar");
         hbFont.Shape(buffer);
-        
-        infos = buffer.GlyphInfos;
-        positions = buffer.GlyphPositions;
-        
-        // --- DEBUG BLOCK: Inspecting Pulli Data (retained for diagnostics) ---
+
+        var infos = buffer.GlyphInfos;
+        var positions = buffer.GlyphPositions;
+
         if (PRINT_LOGS)
         {
             log.AppendLine("--- Shaped Text Analysis (TEST TEXT: " + TEXT_TO_RENDER + ") ---");
             for (int i = 0; i < infos.Length; i++)
             {
                 uint glyphId = infos[i].Codepoint;
-                float xAdv = positions[i].XAdvance / UnitsPerPixel * 0.01f; 
+                float xAdv = positions[i].XAdvance / UnitsPerPixel * 0.01f;
                 float yAdv = positions[i].YAdvance / UnitsPerPixel * 0.01f;
                 float xOff = positions[i].XOffset / UnitsPerPixel * 0.01f;
                 float yOff = positions[i].YOffset / UnitsPerPixel * 0.01f;
-
                 string glyphName = "Glyph ID " + glyphId;
-                
                 if (Mathf.Abs(positions[i].XAdvance) < 1.0f && Mathf.Abs(positions[i].YAdvance) < 1.0f && (positions[i].XOffset != 0 || positions[i].YOffset != 0))
                 {
-                    glyphName += " (POSSIBLE PULLI/MARK)";
+                    glyphName += " (POSSIBLE MARK)";
                 }
-
                 log.AppendLine($"[{i}] {glyphName}: Adv ({xAdv:F4}, {yAdv:F4}), Off ({xOff:F4}, {yOff:F4})");
-                
                 if (glyphAtlas.ContainsKey(glyphId))
                 {
                     var atlasInfo = glyphAtlas[glyphId];
@@ -186,24 +158,21 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
             log.AppendLine("-------------------------------------------");
         }
 
-        // 8. Build mesh
         var mesh = BuildMesh(infos, positions, log);
-        
-        // 9. Setup rendering components
+
         var material = new Material(Shader.Find("UI/Default"));
         material.mainTexture = atlasTexture;
-        
+
         if (GetComponent<MeshRenderer>() == null) gameObject.AddComponent<MeshRenderer>();
         if (GetComponent<MeshFilter>() == null) gameObject.AddComponent<MeshFilter>();
-        
+
         GetComponent<MeshRenderer>().material = material;
         GetComponent<MeshFilter>().mesh = mesh;
-        
-        // 10. Cleanup
+
         buffer?.Dispose();
         hbFont?.Dispose();
-        
-        if (PRINT_LOGS) 
+
+        if (PRINT_LOGS)
         {
             log.AppendLine($"Rendering setup complete.");
             log.AppendLine("--- HarfBuzzDirectRenderer END ---");
@@ -215,15 +184,10 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
     private HashSet<uint> GetAllGlyphIds(SKTypeface typeface, StringBuilder log)
     {
         HashSet<uint> allGlyphIds = new HashSet<uint>();
-        
-        int totalGlyphs = typeface.GlyphCount; 
-
-        for (uint id = 1; id < totalGlyphs; id++)
-        {
-            allGlyphIds.Add(id);
-        }
-
-        if (PRINT_LOGS) log.AppendLine($"INFO: Total unique glyphs found in font: {totalGlyphs}. Adding {allGlyphIds.Count} IDs to rasterization queue.");
+        int totalGlyphs = typeface.GlyphCount;
+        // start from 0 (glyph 0 may be .notdef) but include all to be safe
+        for (uint id = 0; id < totalGlyphs; id++) { allGlyphIds.Add(id); }
+        if (PRINT_LOGS) log.AppendLine($"INFO: Total glyphs in font: {totalGlyphs}. Raster queue contains {allGlyphIds.Count} glyphs.");
         return allGlyphIds;
     }
 
@@ -232,14 +196,13 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
     {
         string imagePath = Path.Combine(cachePath, CACHE_TEX_FILENAME);
         string metadataPath = Path.Combine(cachePath, CACHE_META_FILENAME);
-
         if (!File.Exists(imagePath) || !File.Exists(metadataPath)) return false;
 
         try
         {
             byte[] textureBytes = File.ReadAllBytes(imagePath);
             atlasTexture = new Texture2D(atlasSize, atlasSize, TextureFormat.Alpha8, false);
-            atlasTexture.LoadRawTextureData(textureBytes); 
+            atlasTexture.LoadRawTextureData(textureBytes);
             atlasTexture.Apply();
 
             using (FileStream fs = new FileStream(metadataPath, FileMode.Open))
@@ -251,10 +214,9 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
 
                 for (int i = 0; i < count; i++)
                 {
-                    GlyphMetadata metadata;
                     byte[] buffer = reader.ReadBytes(sizeOfStruct);
                     GCHandle handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-                    metadata = (GlyphMetadata)Marshal.PtrToStructure(handle.AddrOfPinnedObject(), typeof(GlyphMetadata));
+                    GlyphMetadata metadata = (GlyphMetadata)Marshal.PtrToStructure(handle.AddrOfPinnedObject(), typeof(GlyphMetadata));
                     handle.Free();
 
                     glyphAtlas[metadata.glyphId] = new GlyphAtlasInfo
@@ -266,7 +228,6 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
                     };
                 }
             }
-            if (PRINT_LOGS) log.AppendLine($"INFO: Loaded {glyphAtlas.Count} glyph entries from cache.");
             return true;
         }
         catch (Exception e)
@@ -295,7 +256,7 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
                 for (int i = 0; i < alphaPixels.Length; i++)
                 {
                     float a = alphaPixels[i].a;
-                    debugPixels[i] = new Color(a, a, a, 1f); 
+                    debugPixels[i] = new Color(a, a, a, 1f);
                 }
                 debugTex.SetPixels(debugPixels);
                 debugTex.Apply();
@@ -310,8 +271,7 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
             using (FileStream fs = new FileStream(Path.Combine(cachePath, CACHE_META_FILENAME), FileMode.Create))
             using (BinaryWriter writer = new BinaryWriter(fs))
             {
-                writer.Write(glyphAtlas.Count); 
-
+                writer.Write(glyphAtlas.Count);
                 int sizeOfStruct = Marshal.SizeOf<GlyphMetadata>();
 
                 foreach (var pair in glyphAtlas)
@@ -319,17 +279,16 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
                     GlyphMetadata metadata = new GlyphMetadata
                     {
                         glyphId = pair.Key,
-                        uv_x = pair.Value.uvRect.x, uv_y = pair.Value.uvRect.y, 
+                        uv_x = pair.Value.uvRect.x, uv_y = pair.Value.uvRect.y,
                         uv_w = pair.Value.uvRect.width, uv_h = pair.Value.uvRect.height,
                         size_x = pair.Value.size.x, size_y = pair.Value.size.y,
                         bearing_x = pair.Value.bearing.x, bearing_y = pair.Value.bearing.y
                     };
-                    
+
                     byte[] buffer = new byte[sizeOfStruct];
                     GCHandle handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
                     Marshal.StructureToPtr(metadata, handle.AddrOfPinnedObject(), false);
                     handle.Free();
-                    
                     writer.Write(buffer);
                 }
             }
@@ -341,7 +300,7 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
         }
     }
 
-    // --- RASTERIZATION (FIXED: Unconditional Centering for ALL Glyphs) ---
+    // --- RASTERIZATION (place glyph path using HarfBuzz extents; do NOT center) ---
     void RasterizeRequiredGlyphsToAtlas(HarfBuzzSharp.Font hbFont, HashSet<uint> requiredGlyphIds, StringBuilder log)
     {
         if (PRINT_LOGS) log.AppendLine($"INFO: Rasterizing {requiredGlyphIds.Count} required glyphs...");
@@ -351,7 +310,7 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
             if (!hbFont.TryGetGlyphExtents(glyphId, out var extents))
             {
                 if (PRINT_LOGS) log.AppendLine($"WARNING: HarfBuzz failed to get extents for glyph ID {glyphId}. Skipping.");
-                continue; 
+                continue;
             }
 
             // --- Dimension Calculation with Safety Margin ---
@@ -360,9 +319,9 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
 
             int glyphWidth = baseWidth + (padding * 2) + RASTER_SAFETY_MARGIN;
             int glyphHeight = baseHeight + (padding * 2) + RASTER_SAFETY_MARGIN;
-            
+
             // DOT FIX CHECK
-            int minRenderSize = 2; 
+            int minRenderSize = 2;
             bool isZeroSized = (glyphWidth <= padding * 2 + RASTER_SAFETY_MARGIN) || (glyphHeight <= padding * 2 + RASTER_SAFETY_MARGIN);
 
             if (isZeroSized)
@@ -385,157 +344,160 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
             }
 
             ushort ushortGlyphId = (ushort)glyphId;
-            
+
+            // Get path from Skia for this glyph
             using (var path = skFont.GetGlyphPath(ushortGlyphId))
             {
                 if (path != null && !path.IsEmpty)
                 {
+                    // Create an alpha-only surface for the glyph
                     using (var surface = SKSurface.Create(new SKImageInfo(glyphWidth, glyphHeight, SKColorType.Alpha8)))
                     {
                         var canvas = surface.Canvas;
                         canvas.Clear(SKColors.Transparent);
-                        
+
                         using (var paint = new SKPaint { IsAntialias = true, Color = SKColors.White, Style = SKPaintStyle.Fill })
                         {
                             canvas.Save();
-                            
-                            // 1. --- UNCONDITIONAL CENTERING FIX ---
-                            // Aligns the center of the glyph's path to the center of the canvas.
-                            path.GetBounds(out SKRect pathBounds);
-                            
-                            float canvasCenterX = glyphWidth / 2f;
-                            float canvasCenterY = glyphHeight / 2f;
-                            
-                            float dx = canvasCenterX - pathBounds.MidX;
-                            float dy = canvasCenterY - pathBounds.MidY;
 
-                            canvas.Translate(dx, dy); 
-                            
-                            if (PRINT_LOGS && isZeroSized) log.AppendLine($"   -> Glyph {glyphId} (Mark): Centered path with dx={dx:F2}, dy={dy:F2}.");
-                            // -------------------------------------
-                            
+                            // -----------------------
+                            // IMPORTANT: draw the path at the HarfBuzz origin
+                            // extents.XBearing = distance from origin to left of glyph bounding box (in font units)
+                            // extents.YBearing = distance from origin to top of glyph bounding box (in font units)
+                            //
+                            // We translate so that the HarfBuzz origin (0,0) maps to a consistent pixel position inside the glyph box:
+                            // pxOriginX = padding + (-extents.XBearing / UnitsPerPixel)
+                            // pxOriginY = padding + (extents.YBearing / UnitsPerPixel)
+                            //
+                            // NOTE: If the font/harfbuzz signs differ for your environment, you may need to flip the sign of Y here.
+                            // -----------------------
+
+                            float pxOriginX = padding + (-extents.XBearing / UnitsPerPixel);
+                            float pxOriginY = padding + (extents.YBearing / UnitsPerPixel);
+
+                            canvas.Translate(pxOriginX, pxOriginY);
+
+                            if (PRINT_LOGS && isZeroSized) log.AppendLine($"   -> Glyph {glyphId} (likely mark): placed at pxOrigin ({pxOriginX:F2},{pxOriginY:F2})");
+
                             canvas.DrawPath(path, paint);
-                            
+
                             canvas.Restore();
                         }
 
-                        // ... (Pixel copying logic omitted for brevity)
+                        // Copy pixels out of the SKSurface into atlasTexture
                         using (var image = surface.Snapshot())
                         using (var pixmap = image.PeekPixels())
                         {
                             IntPtr pixelPtr = pixmap.GetPixels();
-                            byte[] pixels = new byte[glyphWidth * glyphHeight];
-                            Marshal.Copy(pixelPtr, pixels, 0, pixels.Length);
-                            
+                            // Note: pixmap rowBytes may be >= width; but SKPixmap for Alpha8 should be tightly packed; be defensive
+                            int rowBytes = pixmap.RowBytes;
+                            byte[] rowBuffer = new byte[rowBytes];
+
                             for (int y = 0; y < glyphHeight; y++)
                             {
+                                // copy row by row (accounting for rowBytes)
+                                Marshal.Copy(pixelPtr + y * rowBytes, rowBuffer, 0, rowBytes);
                                 for (int x = 0; x < glyphWidth; x++)
                                 {
-                                    int srcIdx = y * glyphWidth + x;
-                                    byte alpha = pixels[srcIdx];
-                                    
+                                    byte alpha = rowBuffer[x];
                                     int atlasX = currentX + x;
                                     int atlasY = currentY + y;
-                                    
                                     atlasTexture.SetPixel(atlasX, atlasY, new Color(1, 1, 1, alpha / 255f));
                                 }
                             }
                         }
-                    } 
-                } 
+                    }
+                }
                 else
                 {
-                    if (PRINT_LOGS) log.AppendLine($"WARNING: SkiaSharp could not retrieve a path outline for glyph ID {glyphId}. Skipping.");
+                    if (PRINT_LOGS) log.AppendLine($"WARNING: SkiaSharp returned empty path for glyph ID {glyphId}. Skipping.");
                     continue;
                 }
             }
-            
-            // GLYPH ADDED TO ATLAS 
+
+            // GLYPH ADDED TO ATLAS (store bearing using HarfBuzz extents)
             glyphAtlas[glyphId] = new GlyphAtlasInfo
             {
                 glyphId = glyphId,
                 uvRect = new Rect(currentX / (float)atlasSize, currentY / (float)atlasSize, glyphWidth / (float)atlasSize, glyphHeight / (float)atlasSize),
                 size = new Vector2(glyphWidth, glyphHeight),
-                // Store original HarfBuzz bearing for X-spacing
-                bearing = new Vector2(extents.XBearing / UnitsPerPixel, extents.YBearing / UnitsPerPixel) 
+                // store the raw extents bearings (in font units -> convert to pixels/units when used)
+                bearing = new Vector2(extents.XBearing / UnitsPerPixel, extents.YBearing / UnitsPerPixel)
             };
-            
+
             currentX += glyphWidth;
             rowHeight = Mathf.Max(rowHeight, glyphHeight);
         }
-        
-        if (PRINT_LOGS) log.AppendLine($"INFO: Rasterization complete. {glyphAtlas.Count} USEABLE glyphs are in the atlas.");
+
+        if (PRINT_LOGS) log.AppendLine($"INFO: Rasterization complete. {glyphAtlas.Count} glyphs are in the atlas.");
     }
-    
-    // --- MESH BUILDING (FINAL FIX: Y-Positioning based on Height, ignoring YBearing) ---
+
+    // --- MESH BUILDING (use bearing stored from extents; do not apply padding offsets to world placement) ---
     Mesh BuildMesh(GlyphInfo[] infos, GlyphPosition[] positions, StringBuilder log)
     {
         Mesh mesh = new Mesh();
         List<Vector3> vertices = new List<Vector3>();
         List<Vector2> uvs = new List<Vector2>();
         List<int> triangles = new List<int>();
-        
+
         float penX = 0f;
         float penY = 0f;
-        float scale = 0.01f; 
-        
+        float scale = 0.01f; // matches your prior scaling from render units to Unity world units
+
         for (int i = 0; i < infos.Length; i++)
         {
             uint glyphId = infos[i].Codepoint;
-            
+
             if (!glyphAtlas.ContainsKey(glyphId))
             {
                 Debug.LogError($"FAILURE: Missing glyph ID {glyphId} in atlas. Mesh generation skipped for index: {i}");
                 continue;
             }
-            
+
             var atlasInfo = glyphAtlas[glyphId];
             var hbPos = positions[i];
-            
-            // 1. Calculate the initial pen position + HarfBuzz offsets 
+
+            // HarfBuzz anchor point in world units (scale converts font->world)
             float startX = penX + (hbPos.XOffset / UnitsPerPixel * scale);
-            float startY = penY + (hbPos.YOffset / UnitsPerPixel * scale); 
+            float startY = penY + (hbPos.YOffset / UnitsPerPixel * scale);
 
-            // 2. Adjust for quad geometry, padding, and safety margin
-            
-            float xBearingScaled = atlasInfo.bearing.x * scale;
-            float atlasPaddingOffset = padding * scale;
-            float safetyMarginOffset = RASTER_SAFETY_MARGIN / 2f * scale;
+            // Convert stored bearing (which was in font units / UnitsPerPixel) into world units
+            float bearingX_world = atlasInfo.bearing.x * scale; // extents.XBearing / UnitsPerPixel * scale
+            float bearingY_world = atlasInfo.bearing.y * scale; // extents.YBearing / UnitsPerPixel * scale
 
-            // Quad Dimensions
+            // Quad Dimensions (in world units)
             float w = atlasInfo.size.x * scale;
             float h = atlasInfo.size.y * scale;
 
-            // Final X Position: Start X - (HarfBuzz XBearing) - Padding - Margin
-            float finalX = startX - xBearingScaled - atlasPaddingOffset - safetyMarginOffset;
+            // FINAL POSITION of the quad (Top-left)
+            // We want the HarfBuzz origin (the anchor point used by HarfBuzz offsets) to map to the
+            // correct spot inside the glyph quad. Since during rasterization we placed the HarfBuzz
+            // origin at pixel position:
+            //   pxOriginX = padding + (-extents.XBearing / UnitsPerPixel)
+            //   pxOriginY = padding + (extents.YBearing / UnitsPerPixel)
+            //
+            // The top-left of the quad in world units is then:
+            //   topLeftX = startX + bearingX_world
+            //   topLeftY = startY + bearingY_world
+            //
+            // (No subtraction of padding/safety here. Padding is only for atlas packing.)
+            float finalX = startX + bearingX_world;
+            float finalY = startY + bearingY_world;
 
-            // FINAL Y POSITION FIX (Height-Based Alignment):
-            // Since the glyph is centered in the atlas quad, we use the quad height (h) 
-            // to correctly position the quad's top edge (V0) relative to the baseline (startY).
-            // V0 Y = Baseline Y - (Distance from Baseline to Top of Quad)
-            // This formulation ignores the unreliable Y-Bearing metric.
-            float finalY = startY 
-                           - h // Subtract the full height of the quad
-                           + (atlasPaddingOffset) // Add back the padding below the baseline
-                           + safetyMarginOffset; // Add back safety margin
-
-            
-            // Vertices 
+            // Add vertices (V0 Top-Left, V1 Top-Right, V2 Bottom-Right, V3 Bottom-Left)
             int idx = vertices.Count;
+            vertices.Add(new Vector3(finalX, finalY, 0));            // V0
+            vertices.Add(new Vector3(finalX + w, finalY, 0));        // V1
+            vertices.Add(new Vector3(finalX + w, finalY - h, 0));    // V2 (y decreases for bottom)
+            vertices.Add(new Vector3(finalX, finalY - h, 0));        // V3
 
-            vertices.Add(new Vector3(finalX, finalY, 0));             // Top-Left (V0)
-            vertices.Add(new Vector3(finalX + w, finalY, 0));         // Top-Right (V1)
-            vertices.Add(new Vector3(finalX + w, finalY - h, 0));     // Bottom-Right (V2)
-            vertices.Add(new Vector3(finalX, finalY - h, 0));         // Bottom-Left (V3)
-            
-            // UV coordinates (Vertical Flip Fix)
+            // UV (Note: atlas stored as (x,y,width,height) with (0,0) bottom-left)
             Rect uv = atlasInfo.uvRect;
+            uvs.Add(new Vector2(uv.xMin, uv.yMin)); // top-left -> uv bottom-left because Unity origin differences
+            uvs.Add(new Vector2(uv.xMax, uv.yMin));
+            uvs.Add(new Vector2(uv.xMax, uv.yMax));
+            uvs.Add(new Vector2(uv.xMin, uv.yMax));
 
-            uvs.Add(new Vector2(uv.xMin, uv.yMin)); // V0 (Top-Left) <--> UV (Bottom-Left)
-            uvs.Add(new Vector2(uv.xMax, uv.yMin)); // V1 (Top-Right) <--> UV (Bottom-Right)
-            uvs.Add(new Vector2(uv.xMax, uv.yMax)); // V2 (Bottom-Right) <--> UV (Top-Right)
-            uvs.Add(new Vector2(uv.xMin, uv.yMax)); // V3 (Bottom-Left) <--> UV (Top-Left)
-            
             // Triangles
             triangles.Add(idx);
             triangles.Add(idx + 1);
@@ -543,27 +505,27 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
             triangles.Add(idx + 2);
             triangles.Add(idx + 3);
             triangles.Add(idx);
-            
+
             // Advance pen
-            penX += hbPos.XAdvance / UnitsPerPixel * scale;
-            penY += hbPos.YAdvance / UnitsPerPixel * scale;
+            penX += positions[i].XAdvance / UnitsPerPixel * scale;
+            penY += positions[i].YAdvance / UnitsPerPixel * scale;
         }
-        
+
         mesh.SetVertices(vertices);
         mesh.SetUVs(0, uvs);
         mesh.SetTriangles(triangles, 0);
         mesh.RecalculateBounds();
-        
+
         if (PRINT_LOGS) log.AppendLine($"INFO: Mesh built successfully with {vertices.Count} vertices and {triangles.Count / 3} quads.");
-        
+
         return mesh;
     }
-    
+
     void OnDestroy()
     {
         fontFace?.Dispose();
         skTypeface?.Dispose();
-        skFont?.Dispose(); 
+        skFont?.Dispose();
         if (atlasTexture != null)
         {
             Destroy(atlasTexture);
