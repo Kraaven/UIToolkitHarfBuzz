@@ -1,3 +1,6 @@
+
+// THIS CODE IS ONLY FOR REFERENCE, SINCE I KNOW IT WORKS
+
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -64,6 +67,7 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
         if (PRINT_LOGS) log.AppendLine("--- HarfBuzzDirectRenderer START ---");
 
         cachePath = Application.persistentDataPath;
+        print(cachePath);
 
         string fontPath = Path.Combine(Application.streamingAssetsPath, FONT_FILENAME);
         if (!File.Exists(fontPath))
@@ -121,9 +125,9 @@ public class HarfBuzzDirectRenderer : MonoBehaviour
         // Shape text
         var buffer = new HarfBuzzSharp.Buffer();
         buffer.AddUtf16(TEXT_TO_RENDER);
-        buffer.Direction = Direction.RightToLeft;
-        buffer.Script = Script.Arabic;
-        buffer.Language = new Language("ar");
+        buffer.Direction = Direction.LeftToRight;
+        buffer.Script = Script.Tamil;
+        buffer.Language = new Language("ta");
         hbFont.Shape(buffer);
 
         var infos = buffer.GlyphInfos;
